@@ -1,0 +1,1 @@
+{"feature_cols": ["Frequency", "Monetary", "AvgOrderValue", "PurchaseSpan", "TotalItems", "DaysSinceFirst", "PurchaseRate"], "threshold": 0.5, "auc": 0.9989}

@@ -13,17 +13,51 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
 log = logging.getLogger(__name__)
 
 
-# ── 1. Load ───────────────────────────────────────────────────────────────────
+#  1. Load
 
 def load_data(path: str) -> pd.DataFrame:
-    """Load raw CSV and parse dates."""
+    """Load raw CSV and parse dates.
+
+    Handles both the generated synthetic dataset (column names match the
+    pipeline directly) and the real UCI Online Retail II dataset which uses
+    slightly different column names (``Invoice``, ``Customer ID``, ``Price``)
+    and may be ISO-8859-1 encoded.
+
+    Args:
+        path: Path to the raw CSV file.
+
+    Returns:
+        DataFrame with canonical columns: InvoiceNo, StockCode, Description,
+        Quantity, InvoiceDate (datetime), UnitPrice, CustomerID, Country.
+    """
     log.info(f"Loading data from {path}")
-    df = pd.read_csv(path, parse_dates=["InvoiceDate"], dtype={"CustomerID": str})
+
+    # Try UTF-8 first; fall back to latin1 for the real UCI dataset which
+    # contains £ signs and other Western-European characters.
+    try:
+        df = pd.read_csv(path, parse_dates=["InvoiceDate"])
+    except UnicodeDecodeError:
+        df = pd.read_csv(path, parse_dates=["InvoiceDate"], encoding="latin1")
+
+    # Normalise column names from the UCI Online Retail II format to the
+    # internal convention used throughout the pipeline.
+    rename_map = {
+        "Invoice":     "InvoiceNo",
+        "Customer ID": "CustomerID",
+        "Price":       "UnitPrice",
+    }
+    df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
+
+    # Ensure CustomerID is always a string so downstream NaN detection works
+    # consistently regardless of whether the column was originally numeric.
+    if "CustomerID" in df.columns:
+        df["CustomerID"] = df["CustomerID"].astype(str).replace("nan", float("nan"))
+
     log.info(f"  Loaded {len(df):,} rows, {df.shape[1]} columns")
     return df
 
 
-# ── 2. Clean ──────────────────────────────────────────────────────────────────
+#  2. Clean 
 
 def clean_data(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -56,7 +90,7 @@ def clean_data(df: pd.DataFrame) -> pd.DataFrame:
     return df.reset_index(drop=True)
 
 
-# ── 3. RFM Features ───────────────────────────────────────────────────────────
+#  3. RFM Features 
 
 def build_rfm(df: pd.DataFrame, snapshot_date: datetime = None) -> pd.DataFrame:
     """
@@ -93,7 +127,7 @@ def build_rfm(df: pd.DataFrame, snapshot_date: datetime = None) -> pd.DataFrame:
     return rfm
 
 
-# ── 4. Time-Series Features ───────────────────────────────────────────────────
+#  4. Time-Series Features 
 
 def build_time_series(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -137,7 +171,7 @@ def build_time_series(df: pd.DataFrame) -> pd.DataFrame:
     return daily
 
 
-# ── 5. Churn Features ─────────────────────────────────────────────────────────
+#  5. Churn Features 
 
 def build_churn_features(df: pd.DataFrame, rfm: pd.DataFrame,
                          churn_days: int = 90) -> pd.DataFrame:
@@ -164,16 +198,21 @@ def build_churn_features(df: pd.DataFrame, rfm: pd.DataFrame,
         top_countries["Country"].isin(top5), other="Other"
     )
 
+    # Recency is intentionally EXCLUDED from ML features: churned = (Recency >= churn_days),
+    # so including Recency would be direct data leakage — the model would trivially learn
+    # the threshold and report AUC≈1 with no real predictive value.
+    # We keep CustomerID + churned for identification/labelling, and use all other
+    # behavioural signals (Frequency, Monetary, order patterns) as predictors.
     features = rfm[[
-        "CustomerID", "Recency", "Frequency", "Monetary",
+        "CustomerID", "Frequency", "Monetary",
         "AvgOrderValue", "PurchaseSpan", "TotalItems"
     ]].copy()
     features["DaysSinceFirst"] = (snapshot - rfm["FirstPurchase"]).dt.days
     features["PurchaseRate"] = (features["Frequency"] /
                                 (features["DaysSinceFirst"] + 1) * 30).round(4)
 
-    # Churn label
-    features["churned"] = (features["Recency"] >= churn_days).astype(int)
+    # Churn label: 1 if the customer was inactive for the last churn_days days
+    features["churned"] = (rfm["Recency"] >= churn_days).astype(int)
 
     features = features.merge(top_countries, on="CustomerID", how="left")
     features = pd.get_dummies(features, columns=["Country"], drop_first=False)
@@ -184,10 +223,23 @@ def build_churn_features(df: pd.DataFrame, rfm: pd.DataFrame,
     return features
 
 
-# ── 6. Save processed data ────────────────────────────────────────────────────
+#  6. Save processed data 
 
 def save_processed(rfm: pd.DataFrame, ts: pd.DataFrame,
                    churn: pd.DataFrame, out_dir: str) -> None:
+    """Persist all processed datasets in the layout expected by training.
+
+    Args:
+        rfm: Customer-level RFM feature table saved as ``rfm.csv``.
+        ts: Daily revenue time series with forecasting features saved as
+            ``timeseries.csv``.
+        churn: Customer-level churn feature table saved as
+            ``churn_features.csv``.
+        out_dir: Destination directory that will contain the processed files.
+
+    Returns:
+        None
+    """
     os.makedirs(out_dir, exist_ok=True)
     rfm.to_csv(os.path.join(out_dir, "rfm.csv"), index=False)
     ts.to_csv(os.path.join(out_dir, "timeseries.csv"), index=False)
@@ -195,16 +247,32 @@ def save_processed(rfm: pd.DataFrame, ts: pd.DataFrame,
     log.info(f"  Saved processed data to {out_dir}/")
 
 
-# ── 7. Main ───────────────────────────────────────────────────────────────────
+#  7. Main 
 
 def run_pipeline(raw_path: str, processed_dir: str) -> dict:
+    """Run the full raw-to-feature engineering pipeline.
+
+    Args:
+        raw_path: Path to the source retail dataset.
+        processed_dir: Directory where processed CSV outputs should be written.
+
+    Returns:
+        dict: In-memory copies of the generated RFM, time-series, and churn
+        feature tables keyed as ``rfm``, ``timeseries``, and ``churn``.
+
+    Notes:
+        The pipeline loads raw transactions, applies cleaning rules, derives the
+        customer-level RFM table, derives the daily revenue series for
+        forecasting, engineers churn features from customer history, and then
+        saves all three outputs for the downstream training script.
+    """
     df_raw = load_data(raw_path)
     df_clean = clean_data(df_raw)
     rfm = build_rfm(df_clean)
     ts = build_time_series(df_clean)
     churn = build_churn_features(df_clean, rfm)
     save_processed(rfm, ts, churn, processed_dir)
-    log.info("Pipeline complete ✓")
+    log.info("Pipeline complete ")
     return {"rfm": rfm, "timeseries": ts, "churn": churn}
 
 
